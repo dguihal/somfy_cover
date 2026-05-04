@@ -15,6 +15,8 @@ static const char *TAG = "somfy.rts";
 // RX callback from hub
 // ---------------------------------------------------------------------------
 
+#ifdef USE_SOMFY_COVER_RX
+
 void SomfyCover::on_rts_frame_(const RtsDecodedFrame &frame) {
   const bool is_known = this->is_allowed_remote_(frame.remote_code);
 
@@ -84,6 +86,8 @@ bool SomfyCover::is_allowed_remote_(uint32_t code) const {
          std::binary_search(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), code);
 }
 
+#endif  // USE_SOMFY_COVER_RX
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -91,10 +95,12 @@ bool SomfyCover::is_allowed_remote_(uint32_t code) const {
 void SomfyCover::setup() {
   this->storage_ = std::make_unique<NVSRollingCodeStorage>(this->storage_namespace_, this->storage_key_);
 
+#ifdef USE_SOMFY_COVER_RX
   // Register RX callback on hub (if hub has a receiver)
   this->hub_->register_rx_callback([this](const RtsDecodedFrame &frame) {
     this->on_rts_frame_(frame);
   });
+#endif
 
   // Wire up time-based cover triggers
   automationTriggerUp_ = std::make_unique<Automation<>>(this->get_open_trigger());
@@ -122,6 +128,7 @@ void SomfyCover::setup() {
 // ---------------------------------------------------------------------------
 
 void SomfyCover::loop() {
+#ifdef USE_SOMFY_COVER_RX
   if (this->rx_sync_active_) {
     const uint32_t now_ms = millis();
 
@@ -183,6 +190,7 @@ void SomfyCover::loop() {
     }
     return;
   }
+#endif  // USE_SOMFY_COVER_RX
 
   TimeBasedCover::loop();
 }

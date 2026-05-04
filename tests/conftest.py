@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 def _install_esphome_mocks():
     """Populate sys.modules with lightweight mocks of every esphome sub-package
-    that components/somfy_cover/cover.py imports at the top level."""
+    that components/somfy/ imports at the top level."""
 
     esphome = MagicMock()
 
@@ -20,15 +20,16 @@ def _install_esphome_mocks():
     cv.Invalid = Invalid
     esphome.config_validation = cv
 
-    # --- esphome.const (only the symbols cover.py actually imports) ---
+    # --- esphome.const (only the symbols our modules actually import) ---
     const = MagicMock()
     const.CONF_CLOSE_DURATION = "close_duration"
     const.CONF_ID = "id"
     const.CONF_OPEN_DURATION = "open_duration"
     const.PLATFORM_ESP32 = "esp32"
+    const.CONF_TYPE = "type"
     esphome.const = const
 
-    # --- sub-packages imported by cover.py ---
+    # --- sub-packages imported by __init__.py and cover.py ---
     components = MagicMock()
     esphome.components = components
 
@@ -51,5 +52,5 @@ def _install_esphome_mocks():
 # Install mocks before any test module tries to import from the component.
 _install_esphome_mocks()
 
-# Add the components directory to sys.path so `from somfy_cover.cover import …` works.
+# Add the components directory to sys.path so `from somfy.cover import …` works.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "components"))

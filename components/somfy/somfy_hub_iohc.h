@@ -1,0 +1,176 @@
+#pragma once
+
+#include "esphome/core/component.h"
+#include "esphome/components/cc1101/cc1101.h"
+#include <cstdint>
+#include <functional>
+#include <vector>
+
+namespace esphome {
+namespace somfy {
+
+// io-homecontrol protocol constants
+namespace iohc {
+
+// 1W radio parameters
+static constexpr float FREQUENCY_1W = 868.95e6f;
+static constexpr float SYMBOL_RATE = 38400.0f;
+static constexpr float FSK_DEVIATION = 19200.0f;
+static constexpr float FILTER_BW = 100000.0f;
+
+// 2W radio parameters - 3 channel frequency hopping
+static constexpr float FREQUENCY_2W_CH0 = 868.25e6f;
+static constexpr float FREQUENCY_2W_CH1 = 868.95e6f;
+static constexpr float FREQUENCY_2W_CH2 = 869.85e6f;
+static constexpr float FREQUENCY_2W[] = {FREQUENCY_2W_CH0, FREQUENCY_2W_CH1, FREQUENCY_2W_CH2};
+static constexpr uint32_t CHANNEL_DWELL_US = 2700;
+
+// Sync word
+static constexpr uint8_t SYNC1 = 0xFF;
+static constexpr uint8_t SYNC0 = 0x33;
+
+// Broadcast address
+static constexpr uint32_t BROADCAST_ADDR = 0x00003F;
+
+// CRC-16-KERMIT
+static constexpr uint16_t CRC_POLY = 0x8408;
+static constexpr uint16_t CRC_INIT = 0x0000;
+
+// 2W protocol timing
+static constexpr uint32_t SESSION_TIMEOUT_MS = 3000;
+static constexpr uint8_t SESSION_MAX_RETRIES = 2;
+
+// 2W command IDs
+static constexpr uint8_t CMD_EXECUTE = 0x00;
+static constexpr uint8_t CMD_PRIVATE_ACK = 0x21;
+static constexpr uint8_t CMD_ASK_CHALLENGE = 0x31;
+static constexpr uint8_t CMD_KEY_TRANSFER = 0x32;
+static constexpr uint8_t CMD_KEY_TRANSFER_ACK = 0x33;
+static constexpr uint8_t CMD_LAUNCH_KEY_TRANSFER = 0x38;
+static constexpr uint8_t CMD_CHALLENGE_REQUEST = 0x3C;
+static constexpr uint8_t CMD_CHALLENGE_RESPONSE = 0x3D;
+static constexpr uint8_t CMD_STATUS = 0xFE;
+
+// 2W frame control byte flags
+static constexpr uint8_t CTRL0_2W = 0x00;       // isOneWay = 0
+static constexpr uint8_t CTRL1_START_END = 0x03; // StartFrame=1, EndFrame=1
+
+}  // namespace iohc
+
+// Decoded iohc RX packet (from 2W feedback)
+struct IohcDecodedPacket {
+  uint32_t dest_node{0};
+  uint32_t src_node{0};
+  uint8_t cmd{0};
+  const uint8_t *data{nullptr};
+  size_t data_len{0};
+  float rssi{0};
+  uint8_t lqi{0};
+};
+
+// Callback for iohc RX packet notifications
+using IohcRxCallback = std::function<void(const IohcDecodedPacket &pkt)>;
+
+// 2W session completion callback: success flag + optional response data
+using Session2WCallback = std::function<void(bool success, const IohcDecodedPacket *response)>;
+
+// CRC-16-KERMIT helper (shared between hub and devices)
+uint16_t crc16_kermit(const uint8_t *data, size_t len);
+
+// AES-128 ECB helper (shared between hub and devices)
+void aes128_ecb_encrypt(const uint8_t key[16], const uint8_t plaintext[16], uint8_t ciphertext[16]);
+
+// 2W checksum computation (rolling XOR per protocol spec)
+void compute_2w_checksum(const uint8_t *data, size_t len, uint8_t &chk1, uint8_t &chk2);
+
+// 2W challenge response computation
+void compute_2w_response(const uint8_t key[16], const uint8_t *frame_data, size_t frame_len,
+                         const uint8_t challenge[6], uint8_t response[6]);
+
+// 2W state machine states
+enum class Session2WState : uint8_t {
+  IDLE,
+  CMD_SENT,         // Command sent, waiting for 0x3C challenge
+  CHALLENGE_RCVD,   // Challenge received, response being sent
+  WAIT_STATUS,      // Waiting for status/ack from actuator
+  COMPLETE,         // Session done
+  FAILED,           // Session timed out or error
+};
+
+// A pending 2W session (one per command exchange)
+struct Session2W {
+  Session2WState state{Session2WState::IDLE};
+  uint32_t src_node{0};
+  uint32_t dest_node{0};
+  uint8_t cmd{0};
+  std::vector<uint8_t> cmd_data;
+  std::vector<uint8_t> frame_payload;  // dest+src+cmd+data (for IV computation)
+  uint8_t key[16]{};
+  uint8_t challenge[6]{};
+  uint32_t started_ms{0};
+  uint8_t retries{0};
+  Session2WCallback callback;
+};
+
+/// iohc radio hub — owns the CC1101, provides TX/RX and radio configuration.
+/// Devices register for RX callbacks and call transmit_packet() for TX.
+class SomfyIohcHub : public Component,
+                     public cc1101::CC1101Listener {
+ public:
+  void setup() override;
+  void loop() override;
+  void dump_config() override;
+
+  // Configuration
+  void set_cc1101(cc1101::CC1101Component *cc1101) { this->cc1101_ = cc1101; }
+
+  // TX: transmit a raw packet (frame bytes including CRC) with repeats (1W mode)
+  void transmit_packet(const std::vector<uint8_t> &frame, uint8_t repeat_count);
+
+  // 2W TX: send a command with challenge/response authentication
+  void send_2w_command(uint32_t src_node, uint32_t dest_node, uint8_t cmd,
+                       const uint8_t *data, size_t data_len,
+                       const uint8_t key[16], Session2WCallback callback);
+
+  // After TX, return to RX mode
+  void begin_rx();
+
+  // Radio mode configuration
+  void configure_radio_1w();
+  void configure_radio_2w(uint8_t channel);
+
+  // 2W listening control
+  void start_2w_listen();
+  void stop_2w_listen();
+
+  // RX: register a device to receive decoded packets
+  void register_rx_callback(IohcRxCallback callback) {
+    this->rx_callbacks_.push_back(std::move(callback));
+  }
+
+  // CC1101Listener interface
+  void on_packet(const std::vector<uint8_t> &packet, float freq_offset, float rssi, uint8_t lqi) override;
+
+ protected:
+  cc1101::CC1101Component *cc1101_{nullptr};
+
+  // 2W hopping state
+  bool listening_2w_{false};
+  uint8_t current_2w_channel_{0};
+  uint32_t last_hop_us_{0};
+
+  // RX dispatch
+  std::vector<IohcRxCallback> rx_callbacks_;
+
+  // 2W session management
+  Session2W session_;
+  void session_loop_();
+  void handle_2w_packet_(const IohcDecodedPacket &pkt);
+  void send_2w_frame_(uint32_t src, uint32_t dest, uint8_t cmd,
+                      const uint8_t *data, size_t data_len);
+  std::vector<uint8_t> build_2w_frame_(uint32_t src, uint32_t dest, uint8_t cmd,
+                                        const uint8_t *data, size_t data_len);
+};
+
+}  // namespace somfy
+}  // namespace esphome

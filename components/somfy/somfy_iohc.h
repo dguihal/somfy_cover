@@ -1,0 +1,138 @@
+#pragma once
+
+#include "somfy_hub_iohc.h"
+#include "NVSRollingCodeStorage.h"
+#include "esphome/components/button/button.h"
+#include "esphome/components/time_based/cover/time_based_cover.h"
+#include "esphome/core/automation.h"
+#include "esphome/core/component.h"
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <vector>
+
+namespace esphome {
+namespace somfy {
+
+// Transfer key (public, used for 1W encryption and 2W key exchange)
+namespace iohc_keys {
+static constexpr uint8_t TRANSFER_KEY[16] = {
+    0x34, 0xC3, 0x46, 0x6E, 0xD8, 0x8F, 0x4E, 0x8E,
+    0x16, 0xAA, 0x47, 0x39, 0x49, 0x88, 0x43, 0x73
+};
+}  // namespace iohc_keys
+
+// Commands
+namespace iohc_cmd {
+static constexpr uint8_t CMD_EXECUTE = 0x00;
+static constexpr uint8_t CMD_WRITE_PRIVATE = 0x30;
+static constexpr uint8_t CMD_REMOVE_CONTROLLER = 0x39;
+
+// Main Parameters for CMD_EXECUTE
+static constexpr uint16_t MP_OPEN = 0x0000;
+static constexpr uint16_t MP_CLOSE = 0xC800;
+static constexpr uint16_t MP_STOP = 0xD200;
+static constexpr uint16_t MP_MY = 0xD800;
+
+// Originator IDs
+static constexpr uint8_t ORIGINATOR_USER = 0x01;
+static constexpr uint8_t ORIGINATOR_RAIN = 0x02;
+static constexpr uint8_t ORIGINATOR_TIMER = 0x03;
+static constexpr uint8_t ORIGINATOR_SECURITY = 0x08;
+
+// ACEI (Access Control & Encryption Info)
+static constexpr uint8_t ACEI_DEFAULT = 0x43;   // 1W: standard
+static constexpr uint8_t ACEI_2W = 0xE7;        // 2W: authenticated
+
+static constexpr uint8_t TX_REPEAT_COUNT = 4;
+}  // namespace iohc_cmd
+
+// Protocol mode
+enum class IohcMode : uint8_t {
+  MODE_1W,   // One-way (broadcast, HMAC-authenticated)
+  MODE_2W,   // Two-way (unicast, challenge/response authenticated)
+};
+
+class SomfyIohcCover : public time_based::TimeBasedCover {
+ public:
+  void setup() override;
+  void loop() override;
+  void dump_config() override;
+
+  // Configuration setters
+  void set_hub(SomfyIohcHub *hub) { this->hub_ = hub; }
+  void set_prog_button(button::Button *btn) { this->prog_button_ = btn; }
+  void set_remote_code(uint32_t code) { this->node_id_ = code & 0x00FFFFFF; }
+  void set_storage_key(const char *key) { this->storage_key_ = key; }
+  void set_storage_namespace(const char *ns) { this->storage_namespace_ = ns; }
+  void set_repeat_count(int count) { this->repeat_count_ = count; }
+  void set_encryption_key(const char *hex_key);
+  void set_mode(IohcMode mode) { this->mode_ = mode; }
+  void set_target_node(uint32_t node) { this->target_node_ = node & 0x00FFFFFF; }
+
+  void set_open_duration(uint32_t ms) { this->open_duration_ = ms; }
+  void set_close_duration(uint32_t ms) { this->close_duration_ = ms; }
+
+  cover::CoverTraits get_traits() override;
+
+ protected:
+  void control(const cover::CoverCall &call) override;
+
+  // Hub reference (owns radio)
+  SomfyIohcHub *hub_{nullptr};
+  button::Button *prog_button_{nullptr};
+
+  // Per-device identity
+  uint32_t node_id_{0};
+  uint32_t target_node_{0};  // 2W: destination actuator address
+  const char *storage_key_{nullptr};
+  const char *storage_namespace_{nullptr};
+  int repeat_count_{iohc_cmd::TX_REPEAT_COUNT};
+
+  // Protocol mode
+  IohcMode mode_{IohcMode::MODE_1W};
+
+  // Encryption key (system key for 2W, controller key for 1W)
+  uint8_t encryption_key_[16]{};
+  bool has_custom_key_{false};
+
+  // Rolling code storage
+  std::unique_ptr<NVSRollingCodeStorage> storage_;
+
+  // Commands
+  void open();
+  void close();
+  void stop();
+  void program();
+
+  // 1W Protocol (per-device: uses device key + rolling code)
+  void send_1w_command(uint16_t main_param);
+  std::vector<uint8_t> build_1w_frame(uint8_t cmd, const uint8_t *data, size_t data_len, uint32_t dest_node);
+  void compute_1w_hmac(const uint8_t *payload, size_t payload_len, uint16_t sequence, uint8_t *mac_out);
+
+  // 2W Protocol (uses challenge/response via hub session)
+  void send_2w_command(uint16_t main_param);
+  void on_2w_result_(bool success, const IohcDecodedPacket *response);
+
+  // RX handler
+  void on_iohc_packet_(const IohcDecodedPacket &pkt);
+
+  // Action helper for time-based cover triggers
+  template<typename... Ts> class IohcAction : public Action<Ts...> {
+   public:
+    std::function<void(Ts...)> callback;
+    explicit IohcAction(std::function<void(Ts...)> cb) : callback(cb) {}
+    void play(Ts... x) override { if (callback) callback(x...); }
+  };
+
+  // Automations
+  std::unique_ptr<Automation<>> automation_open_;
+  std::unique_ptr<Automation<>> automation_close_;
+  std::unique_ptr<Automation<>> automation_stop_;
+  std::unique_ptr<IohcAction<>> action_open_;
+  std::unique_ptr<IohcAction<>> action_close_;
+  std::unique_ptr<IohcAction<>> action_stop_;
+};
+
+}  // namespace somfy
+}  // namespace esphome

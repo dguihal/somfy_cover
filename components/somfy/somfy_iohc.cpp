@@ -1,0 +1,278 @@
+#include "somfy_iohc.h"
+#include "esphome/core/log.h"
+#include <cstring>
+
+namespace esphome {
+namespace somfy {
+
+static const char *TAG = "somfy.iohc";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+void SomfyIohcCover::set_encryption_key(const char *hex_key) {
+  if (hex_key == nullptr || strlen(hex_key) < 32) {
+    ESP_LOGE(TAG, "Encryption key must be 32 hex characters (16 bytes)");
+    return;
+  }
+  for (int i = 0; i < 16; i++) {
+    char byte_str[3] = {hex_key[i * 2], hex_key[i * 2 + 1], 0};
+    this->encryption_key_[i] = static_cast<uint8_t>(strtol(byte_str, nullptr, 16));
+  }
+  this->has_custom_key_ = true;
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+void SomfyIohcCover::setup() {
+  ESP_LOGCONFIG(TAG, "Setting up Somfy iohc cover...");
+
+  this->storage_ = std::make_unique<NVSRollingCodeStorage>(this->storage_namespace_, this->storage_key_);
+
+  if (!this->has_custom_key_) {
+    memcpy(this->encryption_key_, iohc_keys::TRANSFER_KEY, 16);
+  }
+
+  // Register RX callback on hub
+  this->hub_->register_rx_callback([this](const IohcDecodedPacket &pkt) {
+    this->on_iohc_packet_(pkt);
+  });
+
+  // Wire up time-based cover triggers
+  this->automation_open_ = std::make_unique<Automation<>>(this->get_open_trigger());
+  this->action_open_ = std::make_unique<IohcAction<>>([this]() { this->open(); });
+  this->automation_open_->add_action(this->action_open_.get());
+
+  this->automation_close_ = std::make_unique<Automation<>>(this->get_close_trigger());
+  this->action_close_ = std::make_unique<IohcAction<>>([this]() { this->close(); });
+  this->automation_close_->add_action(this->action_close_.get());
+
+  this->automation_stop_ = std::make_unique<Automation<>>(this->get_stop_trigger());
+  this->action_stop_ = std::make_unique<IohcAction<>>([this]() { this->stop(); });
+  this->automation_stop_->add_action(this->action_stop_.get());
+
+  this->prog_button_->add_on_press_callback([this]() { this->program(); });
+
+  this->has_built_in_endstop_ = true;
+  this->assumed_state_ = true;
+
+  TimeBasedCover::setup();
+}
+
+void SomfyIohcCover::loop() {
+  TimeBasedCover::loop();
+}
+
+void SomfyIohcCover::dump_config() {
+  ESP_LOGCONFIG(TAG, "Somfy iohc cover:");
+  ESP_LOGCONFIG(TAG, "  Node ID: 0x%06X", this->node_id_);
+  ESP_LOGCONFIG(TAG, "  Mode: %s", this->mode_ == IohcMode::MODE_2W ? "2W (bidirectional)" : "1W (broadcast)");
+  if (this->mode_ == IohcMode::MODE_2W) {
+    ESP_LOGCONFIG(TAG, "  Target node: 0x%06X", this->target_node_);
+  }
+  ESP_LOGCONFIG(TAG, "  Storage: %s/%s", this->storage_namespace_, this->storage_key_);
+  ESP_LOGCONFIG(TAG, "  Custom key: %s", this->has_custom_key_ ? "yes" : "no (transfer key)");
+}
+
+cover::CoverTraits SomfyIohcCover::get_traits() {
+  auto traits = TimeBasedCover::get_traits();
+  traits.set_supports_tilt(false);
+  return traits;
+}
+
+void SomfyIohcCover::control(const cover::CoverCall &call) {
+  TimeBasedCover::control(call);
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+void SomfyIohcCover::open() {
+  ESP_LOGD(TAG, "OPEN node=0x%06X mode=%s", this->node_id_,
+           this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
+  if (this->mode_ == IohcMode::MODE_2W)
+    this->send_2w_command(iohc_cmd::MP_OPEN);
+  else
+    this->send_1w_command(iohc_cmd::MP_OPEN);
+}
+
+void SomfyIohcCover::close() {
+  ESP_LOGD(TAG, "CLOSE node=0x%06X mode=%s", this->node_id_,
+           this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
+  if (this->mode_ == IohcMode::MODE_2W)
+    this->send_2w_command(iohc_cmd::MP_CLOSE);
+  else
+    this->send_1w_command(iohc_cmd::MP_CLOSE);
+}
+
+void SomfyIohcCover::stop() {
+  ESP_LOGD(TAG, "STOP node=0x%06X mode=%s", this->node_id_,
+           this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
+  if (this->mode_ == IohcMode::MODE_2W)
+    this->send_2w_command(iohc_cmd::MP_STOP);
+  else
+    this->send_1w_command(iohc_cmd::MP_STOP);
+}
+
+void SomfyIohcCover::program() {
+  ESP_LOGD(TAG, "PROG (pair) node=0x%06X", this->node_id_);
+  auto frame_remove = this->build_1w_frame(iohc_cmd::CMD_REMOVE_CONTROLLER, nullptr, 0, iohc::BROADCAST_ADDR);
+  this->hub_->transmit_packet(frame_remove, static_cast<uint8_t>(this->repeat_count_));
+
+  uint8_t key_data[16];
+  memcpy(key_data, this->encryption_key_, 16);
+  auto frame_key = this->build_1w_frame(iohc_cmd::CMD_WRITE_PRIVATE, key_data, 16, iohc::BROADCAST_ADDR);
+  this->hub_->transmit_packet(frame_key, static_cast<uint8_t>(this->repeat_count_));
+}
+
+// ---------------------------------------------------------------------------
+// 1W Protocol (per-device: uses device key + rolling code)
+// ---------------------------------------------------------------------------
+
+void SomfyIohcCover::send_1w_command(uint16_t main_param) {
+  uint8_t data[2] = {
+      static_cast<uint8_t>(main_param >> 8),
+      static_cast<uint8_t>(main_param & 0xFF)
+  };
+  auto frame = this->build_1w_frame(iohc_cmd::CMD_EXECUTE, data, 2, iohc::BROADCAST_ADDR);
+  this->hub_->transmit_packet(frame, static_cast<uint8_t>(this->repeat_count_));
+}
+
+// ---------------------------------------------------------------------------
+// 2W Protocol (challenge/response via hub session)
+// ---------------------------------------------------------------------------
+
+void SomfyIohcCover::send_2w_command(uint16_t main_param) {
+  // Build CMD_EXECUTE data: Originator(1) + ACEI(1) + MainParam(2) + FP1(1) + FP2(1)
+  uint8_t data[6] = {
+      iohc_cmd::ORIGINATOR_USER,
+      iohc_cmd::ACEI_2W,
+      static_cast<uint8_t>(main_param >> 8),
+      static_cast<uint8_t>(main_param & 0xFF),
+      0x00,  // FP1
+      0x00,  // FP2
+  };
+
+  this->hub_->send_2w_command(
+      this->node_id_, this->target_node_, iohc_cmd::CMD_EXECUTE,
+      data, sizeof(data), this->encryption_key_,
+      [this](bool success, const IohcDecodedPacket *response) {
+        this->on_2w_result_(success, response);
+      });
+}
+
+void SomfyIohcCover::on_2w_result_(bool success, const IohcDecodedPacket *response) {
+  if (success) {
+    ESP_LOGD(TAG, "2W command acknowledged by 0x%06X", this->target_node_);
+    if (response && response->data_len > 0) {
+      // Parse status byte if present (CMD 0xFE: first data byte is status code)
+      if (response->cmd == 0xFE && response->data_len >= 1) {
+        uint8_t status = response->data[0];
+        if (status == 0x05) {
+          ESP_LOGD(TAG, "2W: Actuator reports NO ERROR");
+        } else {
+          ESP_LOGW(TAG, "2W: Actuator reports error code 0x%02X", status);
+        }
+      }
+    }
+  } else {
+    ESP_LOGW(TAG, "2W command to 0x%06X failed (no response)", this->target_node_);
+  }
+}
+
+std::vector<uint8_t> SomfyIohcCover::build_1w_frame(uint8_t cmd, const uint8_t *data,
+                                                      size_t data_len, uint32_t dest_node) {
+  const uint16_t sequence = this->storage_->nextCode();
+
+  std::vector<uint8_t> frame;
+  frame.reserve(11 + data_len + 6 + 2);
+
+  // CtrlByte0: isOneWay=1 (bit 7), size in lower 5 bits
+  // Size = number of bytes after ctrl0+ctrl1 minus 1 (dest+src+cmd+data+hmac - 1)
+  uint8_t payload_size = static_cast<uint8_t>(3 + 3 + 1 + data_len + 6 - 1);  // 12 + data_len
+  uint8_t ctrl0 = 0x80 | (payload_size & 0x1F);  // isOneWay=1
+  frame.push_back(ctrl0);
+
+  // CtrlByte1: StartFrame=1, EndFrame=1 (same as 2W)
+  frame.push_back(iohc::CTRL1_START_END);
+
+  // Destination node ID (3 bytes, big-endian)
+  frame.push_back(static_cast<uint8_t>((dest_node >> 16) & 0xFF));
+  frame.push_back(static_cast<uint8_t>((dest_node >> 8) & 0xFF));
+  frame.push_back(static_cast<uint8_t>(dest_node & 0xFF));
+
+  // Source node ID (3 bytes, big-endian)
+  frame.push_back(static_cast<uint8_t>((this->node_id_ >> 16) & 0xFF));
+  frame.push_back(static_cast<uint8_t>((this->node_id_ >> 8) & 0xFF));
+  frame.push_back(static_cast<uint8_t>(this->node_id_ & 0xFF));
+
+  // Command
+  frame.push_back(cmd);
+
+  // Data
+  for (size_t i = 0; i < data_len; i++) {
+    frame.push_back(data[i]);
+  }
+
+  // HMAC (6 bytes)
+  uint8_t mac[6];
+  this->compute_1w_hmac(frame.data() + 2, frame.size() - 2, sequence, mac);
+  for (int i = 0; i < 6; i++) {
+    frame.push_back(mac[i]);
+  }
+
+  // CRC-16-KERMIT
+  uint16_t crc = crc16_kermit(frame.data(), frame.size());
+  frame.push_back(static_cast<uint8_t>(crc & 0xFF));
+  frame.push_back(static_cast<uint8_t>((crc >> 8) & 0xFF));
+
+  return frame;
+}
+
+void SomfyIohcCover::compute_1w_hmac(const uint8_t *payload, size_t payload_len,
+                                       uint16_t sequence, uint8_t *mac_out) {
+  uint8_t iv[16];
+  memset(iv, 0, 16);
+
+  size_t copy_len = (payload_len > 12) ? 12 : payload_len;
+  memcpy(iv, payload, copy_len);
+
+  iv[12] = static_cast<uint8_t>(sequence >> 8);
+  iv[13] = static_cast<uint8_t>(sequence & 0xFF);
+
+  uint8_t checksum = 0;
+  for (size_t i = 0; i < payload_len; i++) {
+    checksum ^= payload[i];
+  }
+  iv[14] = checksum;
+  iv[15] = 0x00;
+
+  uint8_t encrypted[16];
+  aes128_ecb_encrypt(this->encryption_key_, iv, encrypted);
+
+  memcpy(mac_out, encrypted, 6);
+}
+
+// ---------------------------------------------------------------------------
+// RX callback from hub
+// ---------------------------------------------------------------------------
+
+void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
+  // Only process packets addressed to us or broadcast
+  if (pkt.dest_node != this->node_id_ && pkt.dest_node != iohc::BROADCAST_ADDR)
+    return;
+
+  // For 2W mode, also accept packets from our target actuator
+  if (this->mode_ == IohcMode::MODE_2W && pkt.src_node != this->target_node_)
+    return;
+
+  ESP_LOGD(TAG, "RX for node 0x%06X: src=0x%06X cmd=0x%02X rssi=%.1f",
+           this->node_id_, pkt.src_node, pkt.cmd, pkt.rssi);
+}
+
+}  // namespace somfy
+}  // namespace esphome

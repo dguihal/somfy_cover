@@ -1,4 +1,4 @@
-# ESPHome compile-test with the full RX path enabled.
+# ESPHome compile-test for somfy RTS cover with the full RX path enabled.
 esphome:
   name: test-somfy-rx
 
@@ -21,6 +21,12 @@ remote_receiver:
   id: receiver
   pin: GPIO5
 
+somfy:
+  - id: rts_hub
+    type: rts
+    remote_transmitter: transmitter
+    remote_receiver: receiver
+
 text_sensor:
   - platform: template
     id: detected
@@ -32,15 +38,15 @@ button:
     name: "Prog Button"
 
 cover:
-  - platform: somfy_cover
+  - platform: somfy
+    type: rts
     name: "Test Cover RX"
     open_duration: 40s
     close_duration: 40s
     storage_key: TestKey
     remote_code: 0x123456
     prog_button: prog_button
-    remote_transmitter: transmitter
-    remote_receiver: receiver
+    somfy_id: rts_hub
     detected_remote: detected
     allowed_remotes:
       - 0xABCDEF

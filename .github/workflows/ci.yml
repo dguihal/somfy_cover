@@ -33,7 +33,7 @@ jobs:
       - name: Install test dependencies
         run: pip install -r requirements_test.txt
       - name: Run tests
-        run: pytest tests/ -v --cov=components/somfy_cover --cov-report=term-missing
+        run: pytest tests/ -v --cov=components/somfy --cov-report=term-missing
 
   esphome-compile:
     name: ESPHome Compile (${{ matrix.fixture }})
@@ -41,8 +41,8 @@ jobs:
     strategy:
       matrix:
         fixture:
-          - test_basic
-          - test_rx
+          - test_rts_tx_only
+          - test_rts_rx
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

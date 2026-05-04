@@ -1,4 +1,4 @@
-# Minimal ESPHome config to compile-test the somfy_cover component (TX only).
+# Minimal ESPHome config to compile-test the somfy RTS cover (TX only, no receiver).
 esphome:
   name: test-somfy-basic
 
@@ -17,17 +17,23 @@ remote_transmitter:
   pin: GPIO4
   carrier_duty_percent: 100%
 
+somfy:
+  - id: rts_hub
+    type: rts
+    remote_transmitter: transmitter
+
 button:
   - platform: template
     id: prog_button
     name: "Prog Button"
 
 cover:
-  - platform: somfy_cover
+  - platform: somfy
+    type: rts
     name: "Test Cover"
     open_duration: 40s
     close_duration: 40s
     storage_key: TestKey
     remote_code: 0x123456
     prog_button: prog_button
-    remote_transmitter: transmitter
+    somfy_id: rts_hub
